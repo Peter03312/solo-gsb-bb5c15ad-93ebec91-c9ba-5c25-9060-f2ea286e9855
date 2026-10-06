@@ -40,6 +40,12 @@
   有效关系的最新误差，版本只 +1 并留不可改快照。版本过期返回 409，锚点不
   存在返回 404，锚点所在组不足两片（孤片）拒绝且不写入。
 - **乐观并发**：采纳 / 撤销 / 删除 / 试拼确认 / 轮廓修订确认 / 整体校准确认携带期望版本号，过期版本返回 409 冲突提示。
+- **陶片对间隙查询**：修复师选择一个装配版本与若干陶片对，系统依据该
+  版本快照的**固定轮廓与位姿**逐对计算轮廓边界的最短间隙、对应最近点
+  坐标及是否发生内部重叠，按间隙从小到大、陶片编号排序返回；全程只读，
+  不因计算改变位姿、关系或历史，也不产生新快照。缺少陶片、重复陶片对、
+  跨版本或无效编号时整次拒绝并逐字段指出。间隙为零表示接触，负值（-1）
+  仅用于标识重叠，不得当作可用间隙。
 - **不可改版本快照与历史恢复**：录入/删除碎片、采纳/撤销拼接、试拼确认、
   轮廓修订确认、锚点整体校准确认每次成功都与装配数据在**同一事务**内固化
   一条版本快照（碎片轮廓与位姿、有效及已撤销关系、连通组），快照一经写入
@@ -154,6 +160,7 @@ Compose 默认将数据库挂载到命名卷 `pottery-data` 持久化。
 | `GET` | `/api/assembly` | 装配快照：版本、位姿、连通组、关系 |
 | `GET` | `/api/assembly/versions` | 历史版本清单（版本/来源/快照时间，新版本在前） |
 | `GET` | `/api/assembly/versions/{v}` | 只读查看历史版完整装配（轮廓/位姿/有效及已撤销关系/连通组） |
+| `POST` | `/api/assembly/versions/{v}/gaps` | 陶片对间隙查询：按该版快照计算每对边界最短间隙/最近点/是否重叠（只读） |
 | `POST` | `/api/assembly/versions/{v}/restore/preview` | 恢复预览：恢复后完整装配 + 与当前版碎片/关系差异（不落库） |
 | `POST` | `/api/assembly/versions/{v}/restore/confirm` | 确认恢复（原子恢复原 ID 与状态、重算连通组，版本只 +1，留新快照） |
 | `POST` | `/api/trials/rehearse` | 有序试拼预演（不落库） |
@@ -165,9 +172,11 @@ Compose 默认将数据库挂载到命名卷 `pottery-data` 持久化。
 
 错误约定：`400` 校验拒绝（轮廓自交 / 标记重合 / 标记不在边缘 / 标记数量
 不一致 / 遗漏有效关系 / 误差超限 / 碰撞 / 空序列 / 撤销目标非法 / 目标
-版本即当前版 / **锚点所在组不足两片**），`404` 对象不存在（碎片、关系、
+版本即当前版 / **锚点所在组不足两片** / **空陶片对列表 / 无效编号 /
+同片成对 / 重复陶片对 / 跨版本**），`404` 对象不存在（碎片、关系、
 **目标版本快照**、**锚点碎片**缺失；版本恢复时
-`detail.code=version_not_found`，校准时 `detail.code=fragment_not_found`），
+`detail.code=version_not_found`，校准时 `detail.code=fragment_not_found`，
+**间隙查询时 `detail.code=fragment_not_found` 并逐字段指出缺失陶片**），
 `409` 版本冲突或重复撤销（含恢复预览/确认、**校准预览/确认**的期望版本
 过期），`422` 请求体结构不合法。
 
@@ -548,18 +557,125 @@ curl -X POST http://localhost:8000/api/assembly/versions/2/restore/confirm \
   不写入；目标版不存在 → `404 version_not_found`，不写入；目标版即当前版
   → `400`，不写入。
 
+## 陶片对间隙查询 API
+
+修复师选择**一个装配版本**与**若干陶片对**，系统依据该版本快照中固定的
+轮廓与位姿（世界坐标，毫米制）逐对计算：
+
+- 两片轮廓**边界**的最短间隙 `gap_mm`；
+- 对应的最近点坐标 `point_a` / `point_b`（分别位于两片轮廓边界上）；
+- 是否发生内部重叠 `overlap`（允许共边/共点，面积重叠才算重叠，附
+  `overlap_area_mm2`）。
+
+**间隙语义**：`0` 表示两边界接触（`contact=true`）；负值（固定 `-1`）
+**仅用于标识内部重叠**，无物理意义，**不得当作可用间隙**。结果按间隙
+从小到大、再按陶片编号（`fragment_a`、`fragment_b`）排序返回。
+
+**只读保证**：仅读取指定版本的不可改快照，不修改位姿、关系或历史，也
+不产生新版本快照；当前版与任意历史版均可查询。
+
+### 请求
+
+```
+POST /api/assembly/versions/{version}/gaps
+```
+
+```jsonc
+{
+  "pairs": [
+    { "fragment_a": 1, "fragment_b": 2 },
+    { "fragment_a": 1, "fragment_b": 3 },
+    { "fragment_a": 2, "fragment_b": 4 }
+    // 每对可选 "version": 必须与路径版本一致，否则视为跨版本整次拒绝
+  ]
+}
+```
+
+### 调用示例
+
+```bash
+curl -X POST http://localhost:8000/api/assembly/versions/2/gaps \
+  -H 'Content-Type: application/json' \
+  -d '{"pairs": [{"fragment_a": 1, "fragment_b": 2},
+                 {"fragment_a": 1, "fragment_b":  3},
+                 {"fragment_a": 2, "fragment_b": 4}]}'
+```
+
+响应（按间隙升序；演示数据下 #1/#3 重叠、#1/#2 共边接触、#2/#4 分离）：
+
+```jsonc
+{
+  "ok": true,
+  "version": 2,
+  "source": "accept",
+  "source_label": "采纳拼接",
+  "snapshot_created_at": "2026-10-06T00:41:27+00:00",
+  "current_version": 2,
+  "historical": false,               // 查询的是否为历史版本
+  "pair_count": 3,
+  "pairs": [
+    { "fragment_a": 1, "fragment_b": 3,
+      "name_a": "陶片A-左半", "name_b": "陶片C",
+      "gap_mm": -1.0,                // 负值仅标识内部重叠，非可用间隙
+      "contact": false, "overlap": true,
+      "overlap_area_mm2": 868.321429,
+      "point_a": [0.0, 0.0], "point_b": [0.0, 0.0] },
+    { "fragment_a": 1, "fragment_b": 2,
+      "name_a": "陶片A-左半", "name_b": "陶片B-右半",
+      "gap_mm": 0.0,                 // 间隙为零表示接触
+      "contact": true, "overlap": false, "overlap_area_mm2": 0.0,
+      "point_a": [38.0, 15.0], "point_b": [38.0, 15.0] },
+    { "fragment_a": 2, "fragment_b": 4,
+      "name_a": "陶片B-右半", "name_b": "陶片D",
+      "gap_mm": 5.8835,              // 边界最短间隙（毫米）
+      "contact": false, "overlap": false, "overlap_area_mm2": 0.0,
+      "point_a": [35.7692, 3.8462], "point_b": [30.0, 5.0] }
+  ]
+}
+```
+
+### 整次拒绝（逐字段指出，不执行任何计算）
+
+- `400 empty_pairs`：`pairs` 为空；
+- `400 invalid_pairs`：`detail.errors[]` 逐字段列出全部问题——
+  `invalid_fragment_id`（编号非正整数，字段如 `pairs[0].fragment_a`）、
+  `same_fragment`（两片相同）、`duplicate_pair`（重复陶片对，不分先后）、
+  `cross_version`（某对自带 `version` 与路径版本不一致，仅允许查询同一
+  版本快照）；
+- `404 fragment_not_found`：某对引用的碎片在该版本快照中不存在，
+  `detail.errors[]` 逐字段指出（如 `pairs[0].fragment_b`）；
+- `404 version_not_found`：目标版本快照不存在；
+- `422`：请求体结构不合法（如编号为字符串）。
+
+```bash
+# 重复陶片对 + 无效编号 + 跨版本：一次全部指出
+curl -X POST http://localhost:8000/api/assembly/versions/2/gaps \
+  -H 'Content-Type: application/json' \
+  -d '{"pairs": [{"fragment_a": 1, "fragment_b": 2},
+                 {"fragment_a": 2, "fragment_b": 1},
+                 {"fragment_a": 0, "fragment_b": 3},
+                 {"fragment_a": 3, "fragment_b": 4, "version": 1}]}'
+# 400 {"detail":{"code":"invalid_pairs","errors":[
+#   {"field":"pairs[1]","code":"duplicate_pair", ...},
+#   {"field":"pairs[2].fragment_a","code":"invalid_fragment_id", ...},
+#   {"field":"pairs[3].version","code":"cross_version", ...}]}}
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复端点
+  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复/间隙查询端点
   history.py       # 历史版本：来源标签、连通组重算、碎片/关系差异演算（只读）
   revision.py      # 轮廓修订：边缘标记校验、受影响组误差/碰撞演算（只读）
   calibration.py   # 锚点整体校准：固定锚点的组内刚体最小二乘、误差/碰撞演算（只读）
+  gaps.py          # 陶片对间隙查询：版本快照上的边界最短间隙/最近点/重叠演算（只读）
   trial.py         # 有序试拼：内存快照逐步推演 + 整组提交 + 位姿演算
   geometry.py      # 刚体配准（最小二乘）、轮廓/边缘标记校验、重叠检测
   database.py      # SQLite 持久化、连通组重算、不可改版本快照、按版恢复
   static/          # 浏览器二维画布前端（原生 JS）
+tests/
+  test_gaps.py     # 陶片对间隙查询 API 测试
 Dockerfile
 docker-compose.yml
 requirements.txt

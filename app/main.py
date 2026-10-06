@@ -30,6 +30,12 @@
   确认须提交预览所依据的当前版本号，版本过期或目标版不存在均拒绝且不
   写入；成功时原子恢复该版碎片与关系的原 ID 及状态、重算连通组，装配
   版本只递增一次并留下新快照，旧快照仍可查（详见 history.py）。
+- 陶片对间隙查询（/api/assembly/versions/{v}/gaps）：修复师选择一个装配
+  版本与若干陶片对，系统依据该版本快照的固定轮廓与位姿逐对计算轮廓边界
+  的最短间隙、对应最近点坐标及是否内部重叠，按间隙从小到大、陶片编号
+  排序；只读，不因计算改变位姿、关系或历史，也不产生新快照。缺少陶片、
+  重复陶片对、跨版本或无效编号时整次拒绝并指出字段。间隙为 0 表示接触，
+  负值（-1）仅标识内部重叠，不得当作可用间隙（详见 gaps.py）。
 """
 from __future__ import annotations
 
@@ -42,7 +48,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import calibration, geometry, history, revision, trial
+from . import calibration, gaps, geometry, history, revision, trial
 from .calibration import CalibrationError, evaluate_calibration
 from .database import DB
 from .revision import RevisionError, evaluate_revision
@@ -128,6 +134,18 @@ class CalibrationIn(BaseModel):
     # 锚点碎片 id（位姿固定）+ 预览所依据的当前装配版本（过期 409）
     anchor_id: int
     expected_version: int
+
+
+class GapPairIn(BaseModel):
+    fragment_a: int
+    fragment_b: int
+    # 可选：本对所属版本；与路径版本不一致视为跨版本，整次拒绝
+    version: int | None = None
+
+
+class GapsIn(BaseModel):
+    # 非空陶片对列表；空列表整次拒绝（400 empty_pairs）
+    pairs: list[GapPairIn] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------- 拼接演算
@@ -671,7 +689,7 @@ def _load_snapshot(d: DB, version: int):
     if not rows:
         raise HTTPException(
             404, detail={
-                "message": f"目标版本 v{version} 的快照不存在，无法查看或恢复",
+                "message": f"目标版本 v{version} 的快照不存在",
                 "code": "version_not_found",
                 "version": version,
                 "current_version": d.version(),
@@ -707,6 +725,43 @@ def get_version(version: int):
     with d.lock:
         source, created_at, snap = _load_snapshot(d, version)
         return history.build_history_view(version, source, created_at, snap)
+
+
+@app.post("/api/assembly/versions/{version}/gaps")
+def query_gaps(version: int, payload: GapsIn):
+    """陶片对间隙查询：依据指定版本快照的固定轮廓与位姿，逐对计算轮廓边界
+    的最短间隙、对应最近点坐标及是否内部重叠，按间隙从小到大、陶片编号
+    排序返回。
+
+    只读：不修改位姿、关系或历史，不产生新快照。整次拒绝并指出字段：
+    空列表 / 无效编号 / 同片成对 / 重复陶片对 / 跨版本 → 400；版本快照
+    缺失 → 404 version_not_found；快照中缺少陶片 → 404 fragment_not_found。
+    间隙为 0 表示接触；负值（-1）仅标识内部重叠，不得当作可用间隙。
+    """
+    d = get_db()
+    with d.lock:
+        try:
+            pairs = gaps.validate_pairs(version, payload.pairs)
+        except gaps.GapError as e:
+            raise HTTPException(e.status, e.detail())
+        source, created_at, snap = _load_snapshot(d, version)
+        try:
+            rows = gaps.evaluate_gaps(snap, pairs)
+        except gaps.GapError as e:
+            raise HTTPException(e.status, e.detail())
+        out = gaps.sort_rows([gaps.format_row(r) for r in rows])
+        current = d.version()
+        return {
+            "ok": True,
+            "version": version,
+            "source": source,
+            "source_label": history.source_label(source),
+            "snapshot_created_at": created_at,
+            "current_version": current,
+            "historical": version != current,
+            "pair_count": len(out),
+            "pairs": out,
+        }
 
 
 @app.post("/api/assembly/versions/{version}/restore/preview")
