@@ -30,6 +30,11 @@
   确认须提交预览所依据的当前版本号，版本过期或目标版不存在均拒绝且不
   写入；成功时原子恢复该版碎片与关系的原 ID 及状态、重算连通组，装配
   版本只递增一次并留下新快照，旧快照仍可查（详见 history.py）。
+- 轮廓边界间隙查询（POST /api/clearance/query）：修复师选择一个已固化的
+  装配版本快照与若干陶片对，按该版固定轮廓与位姿计算每对轮廓边界最短
+  间隙、两端最近点坐标及是否内部重叠，按间隙从小到大、陶片编号排序。
+  纯只读，不改位姿/关系/历史；缺少陶片、重复陶片对、跨版本或无效编号
+  时整次拒绝并指出字段（详见 clearance.py）。
 """
 from __future__ import annotations
 
@@ -42,8 +47,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import calibration, geometry, history, revision, trial
+from . import calibration, clearance, geometry, history, revision, trial
 from .calibration import CalibrationError, evaluate_calibration
+from .clearance import ClearanceError, measure_clearance
 from .database import DB
 from .revision import RevisionError, evaluate_revision
 from .trial import TrialError, evaluate_proposal
@@ -128,6 +134,19 @@ class CalibrationIn(BaseModel):
     # 锚点碎片 id（位姿固定）+ 预览所依据的当前装配版本（过期 409）
     anchor_id: int
     expected_version: int
+
+
+class ClearancePairIn(BaseModel):
+    fragment_a: int
+    fragment_b: int
+    # 可选：允许调用方显式携带该对所属版本；与顶层 version 不一致即跨版本拒绝
+    version: int | None = None
+
+
+class ClearanceIn(BaseModel):
+    # 查询所依据的唯一装配版本快照（只读；不改位姿、关系或历史）
+    version: int
+    pairs: list[ClearancePairIn] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------- 拼接演算
@@ -774,6 +793,26 @@ def confirm_restore(version: int, payload: RestoreIn):
         "version": new_version,
         "assembly": restored,
     }
+
+
+# ---------------------------------------------------------------- 轮廓边界间隙查询
+
+@app.post("/api/clearance/query")
+def query_clearance(payload: ClearanceIn):
+    """依据单一版本快照批量计算陶片对的轮廓边界最短间隙（只读）。
+
+    间隙为零表示接触；-1 仅标识内部重叠、不得当作可用间隙（重叠面积另给）。
+    结果按间隙从小到大、陶片编号排序。缺少陶片、重复陶片对、跨版本或无效
+    编号时整次拒绝并逐对指出字段（400）；版本快照不存在返回 404。
+    不改变任何位姿、关系或历史。
+    """
+    d = get_db()
+    pairs = [(p.fragment_a, p.fragment_b, p.version) for p in payload.pairs]
+    with d.lock:
+        try:
+            return measure_clearance(d, payload.version, pairs)
+        except ClearanceError as e:
+            raise HTTPException(e.status, e.detail())
 
 
 # ---------------------------------------------------------------- 前端静态页

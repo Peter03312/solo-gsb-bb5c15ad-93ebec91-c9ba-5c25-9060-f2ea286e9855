@@ -40,6 +40,15 @@
   有效关系的最新误差，版本只 +1 并留不可改快照。版本过期返回 409，锚点不
   存在返回 404，锚点所在组不足两片（孤片）拒绝且不写入。
 - **乐观并发**：采纳 / 撤销 / 删除 / 试拼确认 / 轮廓修订确认 / 整体校准确认携带期望版本号，过期版本返回 409 冲突提示。
+- **轮廓边界间隙查询**：修复师选择**一个已固化的装配版本快照**与若干
+  陶片对，系统依据该版本的固定轮廓与位姿，计算每对轮廓**边界的最短间隙**
+  （mm）、间隙两端分别落在两片轮廓边界上的**最近点世界坐标**，以及是否
+  发生**内部重叠**（面积重叠，允许共边/共点），结果按**间隙从小到大、
+  陶片编号排序**。纯只读：仅允许查询同一版本快照，不改变任何位姿、关系
+  或历史；缺少陶片、重复陶片对（顺序相反算重复）、跨版本或无效编号时
+  **整次拒绝**并逐对指出字段。间隙为零表示**接触**（无可用间隙）；
+  `gap_mm=-1` **仅用于标识重叠，不是深度量度、不得当作可用间隙**，
+  重叠程度另见 `overlap_area_mm2`。
 - **不可改版本快照与历史恢复**：录入/删除碎片、采纳/撤销拼接、试拼确认、
   轮廓修订确认、锚点整体校准确认每次成功都与装配数据在**同一事务**内固化
   一条版本快照（碎片轮廓与位姿、有效及已撤销关系、连通组），快照一经写入
@@ -162,14 +171,128 @@ Compose 默认将数据库挂载到命名卷 `pottery-data` 持久化。
 | `POST` | `/api/fragments/{id}/revision/confirm` | 轮廓修订确认（重新校验同一输入，原子更新，版本只 +1） |
 | `POST` | `/api/calibration/preview` | 锚点整体校准预览（调整前后位姿/逐关系误差/轮廓冲突，不落库） |
 | `POST` | `/api/calibration/confirm` | 锚点整体校准确认（重算校验，原子更新位姿与关系误差，版本只 +1） |
+| `POST` | `/api/clearance/query` | 轮廓边界间隙查询（只读，同一版本快照，最短间隙/最近点/内部重叠） |
 
 错误约定：`400` 校验拒绝（轮廓自交 / 标记重合 / 标记不在边缘 / 标记数量
 不一致 / 遗漏有效关系 / 误差超限 / 碰撞 / 空序列 / 撤销目标非法 / 目标
-版本即当前版 / **锚点所在组不足两片**），`404` 对象不存在（碎片、关系、
+版本即当前版 / **间隙查询字段问题（缺陶片 / 重复陶片对 / 跨版本 / 无效
+编号 / 空陶片对）**），`404` 对象不存在（碎片、关系、
 **目标版本快照**、**锚点碎片**缺失；版本恢复时
-`detail.code=version_not_found`，校准时 `detail.code=fragment_not_found`），
+`detail.code=version_not_found`，校准时 `detail.code=fragment_not_found`，
+**间隙查询版本快照不存在时同样为 `version_not_found`**），
 `409` 版本冲突或重复撤销（含恢复预览/确认、**校准预览/确认**的期望版本
 过期），`422` 请求体结构不合法。
+
+## 轮廓边界间隙查询 API
+
+修复师选择**一个已固化的装配版本**与若干陶片对，系统依据该版本快照中每片
+陶片的固定轮廓与位姿 `(x, y, theta)`（world = R(θ)·local + (x, y)），在
+世界坐标系（毫米）下计算每对轮廓**边界之间的最短间隙**、**最近点坐标**与
+**是否内部重叠**。接口**只读**：不改变任何位姿、关系或历史，也不产生快照；
+一次查询**仅允许使用同一版本快照**（当前版或任意历史版均可）。
+
+请求体：
+
+```jsonc
+{
+  "version": 3,                         // 必填：查询所依据的唯一装配版本快照
+  "pairs": [                            // 必填且非空：陶片对列表
+    {"fragment_a": 1, "fragment_b": 2},
+    {"fragment_a": 2, "fragment_b": 3, "version": 3}  // 可选携带版本；与顶层不一致即跨版本拒绝
+  ]
+}
+```
+
+- 输出对中的 `fragment_a / fragment_b` 恒按**小编号在前**规整（与请求中
+  的顺序无关），`index` 保留该对在请求中的下标便于回对；
+- 结果按 `gap_mm` **从小到大**排序（重叠 `-1` 在前、接触 `0` 其次、
+  分离在后），间隙相同按 `fragment_a`、再 `fragment_b` 编号升序。
+
+### 调用示例
+
+```bash
+curl -X POST http://localhost:8000/api/clearance/query \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"pairs":[
+    {"fragment_a":1,"fragment_b":2},
+    {"fragment_a":3,"fragment_b":4}
+  ]}'
+```
+
+```jsonc
+{
+  "ok": true,
+  "version": 1,
+  "pair_count": 2,
+  "results": [
+    {
+      "index": 0,
+      "fragment_a": 1, "fragment_b": 2,
+      "name_a": "陶片A-左半", "name_b": "陶片B-右半",
+      "state": "overlap",                 // overlap=内部重叠 / contact=接触 / separated=分离
+      "gap_mm": -1.0,                     // -1 仅标识重叠，不是可用间隙
+      "contact": false, "overlap": true,
+      "usable_clearance": false,          // 仅分离（gap>0）时为 true
+      "nearest_point_a": [1.0, 0.0],      // 间隙一端（#1 轮廓边界上的最近点，世界坐标 mm）
+      "nearest_point_b": [1.0, 0.0],      // 间隙另一端（#2 轮廓边界上的最近点）
+      "overlap_area_mm2": 2036.625        // 内部重叠面积（重叠时有效，否则为 0）
+    },
+    {
+      "index": 1,
+      "fragment_a": 3, "fragment_b": 4,
+      "state": "contact",
+      "gap_mm": 0.0,                      // 0 = 边界接触（共边/共点），无可用间隙
+      "contact": true, "overlap": false,
+      "usable_clearance": false,
+      "nearest_point_a": [0.0, 0.0],
+      "nearest_point_b": [0.0, 0.0],
+      "overlap_area_mm2": 0.0
+    }
+  ]
+}
+```
+
+间隙语义（调用方务必区分）：
+
+| state | `gap_mm` | 含义 | `usable_clearance` |
+| --- | --- | --- | --- |
+| `separated` | `> 0` | 两片边界分离，该值即最短可用间隙（mm） | `true` |
+| `contact` | `0` | 边界接触（共边或共点），没有可用间隙 | `false` |
+| `overlap` | `-1` | **负值仅标识内部重叠**，不是穿透深度、不得当作可用间隙；重叠程度看 `overlap_area_mm2` | `false` |
+
+最近点在任何状态下都取自**两条轮廓边界**（即使一片完全包含在另一片内部，
+也返回两边界彼此最接近的点对）；接触时两点坐标相同。
+
+### 整次拒绝与字段错误
+
+存在以下任一情况时**整次拒绝**（`400 {"detail":{"code":"rejected",
+"errors":[...]}}`，不执行任何计算），`errors[]` 一次性列出全部问题对，
+每条含 `index / field / code / message`：
+
+| code | 触发条件 | field 示例 |
+| --- | --- | --- |
+| `fragment_missing` | 陶片编号在该版本快照中不存在 | `pairs[0].fragment_b` |
+| `duplicate_pair` | 同一陶片对重复出现（`(1,2)` 与 `(2,1)` 视为重复） | `pairs[2]` |
+| `cross_version` | 某对携带的 `version` 与顶层版本不一致（仅允许同一快照） | `pairs[2].version` |
+| `invalid_fragment_id` | 编号不是正整数（如 `0`、负数） | `pairs[1].fragment_a` |
+| `invalid_pair` | 一对中两片编号相同 | `pairs[3]` |
+| `empty_pairs` | `pairs` 为空列表 | `pairs` |
+
+```bash
+# 多种字段问题一次返回；HTTP 400
+curl -X POST http://localhost:8000/api/clearance/query \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"pairs":[
+    {"fragment_a":1,"fragment_b":99},
+    {"fragment_a":-3,"fragment_b":4},
+    {"fragment_a":1,"fragment_b":2,"version":5}
+  ]}'
+# detail.errors 分别为 fragment_missing / invalid_fragment_id / cross_version，
+# 并指出 pairs[0].fragment_b、pairs[1].fragment_a、pairs[2].version
+```
+
+版本快照不存在 → `404 {"detail":{"code":"version_not_found",
+"field":"version", ...}}`；请求体结构不合法（缺字段 / 类型错误）→ `422`。
 
 ## 有序试拼 API
 
@@ -556,6 +679,7 @@ app/
   history.py       # 历史版本：来源标签、连通组重算、碎片/关系差异演算（只读）
   revision.py      # 轮廓修订：边缘标记校验、受影响组误差/碰撞演算（只读）
   calibration.py   # 锚点整体校准：固定锚点的组内刚体最小二乘、误差/碰撞演算（只读）
+  clearance.py     # 轮廓边界间隙查询：同版快照下最短间隙、最近点、内部重叠演算（只读）
   trial.py         # 有序试拼：内存快照逐步推演 + 整组提交 + 位姿演算
   geometry.py      # 刚体配准（最小二乘）、轮廓/边缘标记校验、重叠检测
   database.py      # SQLite 持久化、连通组重算、不可改版本快照、按版恢复
